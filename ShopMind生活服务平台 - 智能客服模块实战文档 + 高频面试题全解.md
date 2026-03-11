@@ -1,0 +1,609 @@
+# ShopMind生活服务平台 - 智能客服模块实战文档 + 高频面试题全解
+
+## 文档说明
+
+本文档包含两大部分核心内容：
+
+1. 智能客服模块实战落地指南：从环境准备到核心代码实现，完整复刻ShopMind项目的智能客服开发流程，基于黑马点评项目无缝整合；
+
+2. 项目高频面试题&标准答案：覆盖智能客服模块、ShopMind平台整体升级点、黑马点评核心技术，标注回答重点与时长，可直接背诵用于面试。
+
+---
+
+# 第一部分：智能客服模块实战落地指南
+
+## 一、模块核心定位
+
+基于阿里云百炼大模型 + LangChain4j + Redis，在黑马点评项目基础上新增智能客服功能，实现「自然对话+会话记忆+业务工具调用+预约落地」的一体化能力，核心适配生活服务平台的商户查询、优惠券咨询、到店预约等核心场景。
+
+## 二、技术选型（与黑马点评完全复用）
+
+|技术组件|核心作用|复用说明|
+|---|---|---|
+|Spring Boot 2.3.x|后端核心框架|完全复用黑马点评项目基础配置|
+|Spring MVC|接口开发|复用项目的控制器、拦截器体系|
+|Redis|会话记忆、高频问题缓存、限流|复用黑马点评的Redis连接配置（StringRedisTemplate）|
+|MySQL|业务数据存储（商户、预约、优惠券）|复用黑马点评的商户表、新增预约表即可|
+|LangChain4j|大模型调用、工具管理、会话记忆封装|新增依赖，简化大模型开发复杂度|
+|阿里云百炼（通义千问）|自然语言交互核心|国内合规大模型，易申请API Key|
+## 三、前置准备
+
+### 1. 阿里云百炼API Key申请
+
+1. 登录[阿里云百炼控制台](https://dashscope.console.aliyun.com/)；
+
+2. 开通“通义千问”服务，创建API Key（保存好，后续配置使用）。
+
+### 2. 数据库表新增（仅需补充预约表）
+
+复用黑马点评的`tb_merchant`（商户）、`tb_user`（用户）表，新增预约表适配客服预约功能：
+
+```sql
+CREATE TABLE `tb_reserve` (
+  `id` bigint(20) NOT NULL AUTO_INCREMENT COMMENT '预约ID',
+  `user_id` bigint(20) NOT NULL COMMENT '用户ID',
+  `merchant_id` bigint(20) NOT NULL COMMENT '商户ID',
+  `reserve_time` varchar(50) NOT NULL COMMENT '预约时间',
+  `create_time` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  PRIMARY KEY (`id`),
+  KEY `idx_user_merchant` (`user_id`,`merchant_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='到店预约表';
+```
+
+### 3. 依赖引入（黑马点评pom.xml新增）
+
+```xml
+<!-- LangChain4j 核心依赖 -->
+<dependency>
+    <groupId>dev.langchain4j</groupId>
+    <artifactId>langchain4j</artifactId>
+    <version>0.27.0</version>
+</dependency>
+<!-- 阿里云百炼适配 -->
+<dependency>
+    <groupId>dev.langchain4j</groupId>
+    <artifactId>langchain4j-aliyun-tongyi</artifactId>
+    <version>0.27.0</version>
+</dependency>
+<!-- Redis会话记忆支持 -->
+<dependency>
+    <groupId>dev.langchain4j</groupId>
+    <artifactId>langchain4j-redis</artifactId>
+    <version>0.27.0</version>
+</dependency>
+<!-- 可选：重试机制 -->
+<dependency>
+    <groupId>org.springframework.retry</groupId>
+    <artifactId>spring-retry</artifactId>
+</dependency>
+```
+
+## 四、核心配置（application.yml）
+
+复用黑马点评的Redis、MySQL配置，新增大模型配置：
+
+```yaml
+# 服务器配置（复用）
+server:
+  port: 8081
+
+# MySQL配置（复用）
+spring:
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://localhost:3306/hm_dianping?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai
+    username: root
+    password: root
+  # Redis配置（复用）
+  redis:
+    host: 127.0.0.1
+    port: 6379
+    password:
+    lettuce:
+      pool:
+        max-active: 50
+        max-idle: 20
+        min-idle: 5
+
+# LangChain4j 大模型配置
+langchain4j:
+  aliyun-tongyi:
+    api-key: 你的阿里云百炼API Key  # 替换为实际API Key
+    model-name: qwen-plus  # 通义千问增强版（推荐）
+  # 会话记忆配置
+  redis:
+    chat-memory:
+      ttl: 86400  # 会话记忆过期时间：24小时
+```
+
+## 五、核心代码实现（分6步，无缝整合黑马点评）
+
+### 步骤1：复用黑马点评核心业务Service
+
+确保黑马点评的`IMerchantService`（商户查询）、`UserHolder`（用户上下文）已实现，新增预约服务：
+
+```java
+// 预约服务接口（MyBatis-Plus）
+public interface IReserveService extends IService<Reserve> {
+}
+
+// 预约服务实现
+@Service
+public class ReserveServiceImpl extends ServiceImpl<ReserveMapper, Reserve> implements IReserveService {
+}
+```
+
+### 步骤2：实现Redis会话记忆管理器（核心）
+
+解决大模型“健忘”问题，复用黑马点评的`StringRedisTemplate`：
+
+```java
+package com.hmdp.service.chat;
+
+import com.hmdp.utils.StringRedisTemplate;
+import dev.langchain4j.memory.chat.ChatMemory;
+import dev.langchain4j.memory.chat.RedisChatMemory;
+import org.springframework.stereotype.Component;
+
+import javax.annotation.Resource;
+
+/**
+ * Redis会话记忆管理器：为每个用户生成独立的会话记忆
+ */
+@Component
+public class RedisChatMemoryProvider {
+
+    @Resource
+    private StringRedisTemplate stringRedisTemplate;
+
+    /**
+     * 获取用户的会话记忆
+     * @param userId 用户ID（从黑马点评UserHolder获取）
+     * @return 会话记忆对象
+     */
+    public ChatMemory getChatMemory(Long userId) {
+        // 会话记忆Redis Key：chat:memory:用户ID
+        String memoryKey = "chat:memory:" + userId;
+        return RedisChatMemory.builder()
+                .stringRedisTemplate(stringRedisTemplate)
+                .key(memoryKey)
+                .maxMessages(20)  // 限制最大记忆轮数，避免上下文过长
+                .build();
+    }
+}
+```
+
+### 步骤3：定义业务工具（对接黑马点评核心功能）
+
+让大模型能“调用业务接口”，实现商户查询、预约到店核心能力：
+
+```java
+package com.hmdp.service.chat.tool;
+
+import com.hmdp.entity.Merchant;
+import com.hmdp.entity.Reserve;
+import com.hmdp.service.IMerchantService;
+import com.hmdp.service.IReserveService;
+import dev.langchain4j.agent.tool.Tool;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Component;
+
+import java.util.List;
+import java.util.stream.Collectors;
+
+/**
+ * 智能客服业务工具：大模型可自动调用的业务方法
+ */
+@Component
+@RequiredArgsConstructor
+public class MerchantChatTool {
+
+    private final IMerchantService merchantService;
+    private final IReserveService reserveService;
+
+    /**
+     * 工具：查询附近商户（适配用户“推荐XX商家”需求）
+     * @param keyword 商户关键词（如火锅、奶茶）
+     * @param longitude 用户经度（黑马点评GEO功能）
+     * @param latitude 用户纬度
+     * @return 格式化的商户信息，供大模型整理回答
+     */
+    @Tool("查询用户附近的指定类型商户，返回商户名称、评分、距离")
+    public String searchNearbyMerchant(String keyword, Double longitude, Double latitude) {
+        // 复用黑马点评的附近商户查询逻辑（基于Redis GEO排序）
+        List<Merchant> merchants = merchantService.searchNearby(keyword, longitude, latitude);
+        if (merchants.isEmpty()) {
+            return "未找到符合条件的商户";
+        }
+        // 格式化结果，让大模型能准确理解
+        return merchants.stream()
+                .map(m -> String.format("商户名称：%s，评分：%.1f，距离：%d米",
+                        m.getName(), m.getScore(), m.getDistance()))
+                .collect(Collectors.joining("\n"));
+    }
+
+    /**
+     * 工具：预约商户到店（适配用户“预约XX店”需求）
+     * @param merchantId 商户ID
+     * @param userId 用户ID
+     * @param reserveTime 预约时间（如2025-12-20 18:00）
+     * @return 预约结果
+     */
+    @Tool("为用户预约指定商户的到店时间，返回预约成功/失败信息")
+    public String reserveMerchant(Long merchantId, Long userId, String reserveTime) {
+        // 校验商户是否存在
+        if (!merchantService.existsById(merchantId)) {
+            return "预约失败：商户不存在";
+        }
+        // 保存预约记录
+        Reserve reserve = new Reserve();
+        reserve.setUserId(userId);
+        reserve.setMerchantId(merchantId);
+        reserve.setReserveTime(reserveTime);
+        reserveService.save(reserve);
+        return String.format("预约成功！商户ID：%d，预约时间：%s", merchantId, reserveTime);
+    }
+}
+```
+
+### 步骤4：核心客服服务（整合大模型+记忆+工具）
+
+```java
+package com.hmdp.service.chat;
+
+import com.hmdp.service.chat.tool.MerchantChatTool;
+import dev.langchain4j.ai.model.chat.ChatLanguageModel;
+import dev.langchain4j.model.aliyun.tongyi.AliyunTongYiChatModel;
+import dev.langchain4j.service.AiServices;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.retry.annotation.EnableRetry;
+
+import javax.annotation.Resource;
+
+/**
+ * 智能客服核心服务：整合大模型、会话记忆、业务工具
+ */
+@Configuration
+@EnableRetry  // 开启重试机制，应对大模型API超时
+public class ChatServiceConfig {
+
+    @Resource
+    private RedisChatMemoryProvider chatMemoryProvider;
+    @Resource
+    private MerchantChatTool merchantChatTool;
+
+    /**
+     * 定义AI服务接口：统一客服对话能力
+     */
+    public interface ShopMindChatService {
+        /**
+         * 客服对话核心方法
+         * @param userId 用户ID（绑定会话记忆）
+         * @param question 用户问题
+         * @return 客服回答
+         */
+        String chat(Long userId, String question);
+    }
+
+    /**
+     * 初始化AI服务实例
+     */
+    @Bean
+    public ShopMindChatService shopMindChatService() {
+        // 构建阿里云百炼大模型客户端
+        ChatLanguageModel chatModel = AliyunTongYiChatModel.builder()
+                .apiKey(System.getProperty("langchain4j.aliyun-tongyi.api-key")) // 从配置读取
+                .modelName("qwen-plus")
+                .timeout(5000)  // API超时时间：5秒
+                .build();
+
+        // 整合大模型、会话记忆、业务工具
+        return AiServices.builder(ShopMindChatService.class)
+                .chatLanguageModel(chatModel)
+                .chatMemoryProvider(chatMemoryProvider::getChatMemory)  // 绑定会话记忆
+                .tools(merchantChatTool)  // 注册业务工具
+                .build();
+    }
+}
+```
+
+### 步骤5：接口层开发（提供前端调用）
+
+复用黑马点评的登录拦截器，确保用户已登录后才能使用客服：
+
+```java
+package com.hmdp.controller;
+
+import com.hmdp.dto.Result;
+import com.hmdp.service.chat.ChatServiceConfig.ShopMindChatService;
+import com.hmdp.utils.UserHolder;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+import javax.annotation.Resource;
+
+/**
+ * 智能客服接口层
+ */
+@RestController
+@RequestMapping("/chat")
+public class ChatController {
+
+    @Resource
+    private ShopMindChatService shopMindChatService;
+
+    /**
+     * 客服对话接口（前端核心调用）
+     * @param question 用户提问内容
+     * @return 统一响应结果（包含客服回答）
+     */
+    @PostMapping("/ask")
+    public Result ask(@RequestParam String question) {
+        // 复用黑马点评的用户上下文，获取当前登录用户ID
+        Long userId = UserHolder.getUser().getId();
+        // 调用AI服务获取回答
+        String answer = shopMindChatService.chat(userId, question);
+        return Result.ok(answer);
+    }
+}
+```
+
+### 步骤6：拦截器放行（关键！）
+
+在黑马点评的`MvcConfig`中，给客服接口添加放行规则，避免登录拦截：
+
+```java
+// 新增放行路径：/chat/ask
+.excludePathPatterns(
+        "/api/user/code",
+        "/api/user/login",
+        "/chat/ask"  // 智能客服接口放行
+)
+```
+
+## 六、功能测试（验证核心能力）
+
+### 测试场景1：商户查询
+
+- 用户请求：`/chat/ask?question=我在西湖附近，推荐一家评分4.5以上的火锅店`
+
+- 执行流程：大模型识别意图 → 调用`searchNearbyMerchant`工具 → 返回商户列表 → 大模型整理自然语言回答
+
+- 预期结果：`为你推荐西湖附近评分4.5以上的火锅店：XX火锅（评分4.8，距离500米）、YY火锅（评分4.6，距离800米）`
+
+### 测试场景2：预约到店
+
+- 用户请求：`/chat/ask?question=帮我预约XX火锅明天晚上6点`
+
+- 执行流程：大模型识别意图 → 调用`reserveMerchant`工具 → 写入预约表 → 大模型返回预约结果
+
+- 预期结果：`已为你成功预约XX火锅（商户ID：101）明天晚上6点的座位，请注意查收通知~`
+
+### 测试场景3：会话记忆
+
+- 第一步：`/chat/ask?question=推荐一家西湖附近的咖啡店`
+
+- 第二步：`/chat/ask?question=它的地址是什么`
+
+- 预期结果：大模型能关联上一步推荐的咖啡店，返回具体地址（Redis会话记忆生效）。
+
+## 七、企业级优化（简历亮点）
+
+|优化点|实现方式|面试价值|
+|---|---|---|
+|大模型API限流|用Redis的`INCR + EXPIRE`，限制每个用户1分钟最多5次提问|体现高并发限流能力|
+|高频问题缓存|把“优惠券怎么用”等常见问题的回答缓存到Redis，优先查缓存不调大模型|降低API成本，提升响应速度|
+|失败重试+降级|用`@Retryable`做3次重试，超时则返回兜底回答|体现服务稳定性设计|
+|敏感词过滤|调用大模型前，用正则过滤敏感词（如辱骂、违规内容）|体现合规性设计|
+---
+
+# 第二部分：ShopMind生活服务平台高频面试题&标准答案
+
+## 一、智能客服模块专项面试题（核心）
+
+### 1. 你做的智能客服核心架构是什么？
+
+- 回答时长：1分钟
+
+- 标准答案：核心是「大模型+Redis会话记忆+业务工具调用」的三层架构：
+        
+
+    1. 会话层：用Redis Hash存储用户对话历史（Key: chat:memory:用户ID），限制20轮记忆，解决大模型健忘问题；
+
+    2. 工具层：基于LangChain4j的@Tool注解，封装商户查询、预约到店等黑马点评业务工具；
+
+    3. 模型层：接入阿里云百炼通义千问，实现自然语言交互，自动识别意图并调用工具。
+
+### 2. 为什么用Redis存储会话记忆，而不是MySQL？
+
+- 回答时长：40秒
+
+- 标准答案：核心是性能+场景适配：
+        
+
+    1. 性能：会话记忆是高频读写（每轮对话都要查/更），Redis读写速度是MySQL的100倍以上，响应时间从10ms降到1ms；
+
+    2. 过期策略：Redis可自动设置24小时过期，清理无效会话，MySQL需手动写定时任务；
+
+    3. 结构适配：对话历史是KV结构，Redis Hash天然适配，数据库建表冗余且低效。
+
+### 3. 大模型如何精准调用业务工具？比如用户说“预约火锅”，怎么触发预约工具？
+
+- 回答时长：1分钟
+
+- 标准答案：核心是「注解+Prompt+意图解析」：
+        
+
+    1. 工具标注：给业务方法加@Tool注解，明确工具用途（如“预约商家到店”）；
+
+    2. 工具注册：初始化AI服务时，把工具注册到大模型，LangChain4j自动生成工具描述（入参、功能）；
+
+    3. 意图匹配：大模型解析用户问题后，匹配工具描述，自动提取参数（如商户ID、时间）；
+
+    4. 追问补参：参数不全时，大模型会主动追问（如“请问你想预约几点到店？”）。
+
+### 4. 智能客服的性能瓶颈在哪？你是怎么优化的？
+
+- 回答时长：1分钟
+
+- 标准答案：核心瓶颈+优化方案：
+        
+
+    1. 大模型API耗时（约500ms）→ 优化：缓存常见问题回答（Redis String），直接返回无需调模型；
+
+    2. 会话记忆过长→ 优化：限制20轮记忆+对话摘要（用大模型总结长对话）；
+
+    3. API调用成本高→ 优化：Redis限流（每用户1分钟5次），避免恶意调用；
+
+    4. API超时→ 优化：Spring Retry重试3次，超时返回兜底回答。
+
+### 5. 大模型调用失败（如API超时、Key过期），你怎么处理？
+
+- 回答时长：40秒
+
+- 标准答案：采用「重试+降级+监控」的三级保障：
+        
+
+    1. 重试：用@Retryable做3次重试，每次间隔1秒，应对临时网络波动；
+
+    2. 降级：重试失败后，返回预设兜底回答（“客服暂时繁忙，请稍后再试，或直接联系商家XXX”）；
+
+    3. 监控：把失败请求记录到MySQL，结合日志告警，及时排查API Key过期、服务宕机等问题。
+
+### 6. 这个智能客服和普通聊天机器人的区别是什么？
+
+- 回答时长：30秒
+
+- 标准答案：核心区别是「业务落地能力」：
+        普通聊天机器人只有纯文本对话；我的智能客服能调用黑马点评的业务接口，返回真实商户数据、完成预约操作，实现“对话即服务”，而非单纯的文字交互。
+      
+
+## 二、ShopMind平台整体升级面试题（结合黑马点评）
+
+### 1. 你的ShopMind项目和原始黑马点评的核心区别是什么？
+
+- 回答时长：1分钟
+
+- 标准答案：做了架构、高并发、功能三个维度的升级：
+        
+
+    1. 架构升级：从Redis单级缓存→「本地缓存（Caffeine）+ Redis + MySQL」三级缓存，响应时间从10ms→1ms，缓存命中率99%；
+
+    2. 高并发升级：Redis Stream异步下单→Kafka消息队列+死信队列，秒杀QPS从1000→5000，成功率99.9%；
+
+    3. 功能升级：新增智能客服模块，整合大模型+Redis会话记忆+业务工具，实现自然对话+业务操作一体化。
+
+### 2. 你项目中的三级缓存是如何设计的？怎么保证缓存一致性？
+
+- 回答时长：1分钟
+
+- 标准答案：设计+一致性保障：
+        
+
+    1. 查询策略：本地缓存→Redis→MySQL（层层兜底）；
+
+    2. 更新策略（Cache Aside）：更新MySQL→删除本地缓存→删除Redis缓存（不直接更新，避免并发脏数据）；
+
+    3. 一致性保障：
+                
+
+        - 本地缓存设5分钟TTL兜底，删除失败也会自动过期；
+
+        - 核心商户更新加Redisson分布式锁，避免并发冲突。
+
+### 3. 布隆过滤器在项目中解决了什么问题？具体怎么实现的？
+
+- 回答时长：40秒
+
+- 标准答案：解决商户查询的缓存穿透问题（用户查不存在的商户ID，请求打穿到MySQL）：
+        
+
+    1. 实现：项目启动时，把所有商户ID加载到Redisson布隆过滤器（误判率0.01）；
+
+    2. 流程：用户查询商户时，先过布隆过滤器，判断ID不存在则直接返回，不查缓存和数据库；
+
+    3. 效果：MySQL无效查询减少90%，CPU使用率从80%→20%。
+
+### 4. 秒杀模块如何解决超卖和“一人一单”问题？
+
+- 回答时长：1分钟
+
+- 标准答案：分两步解决，结合Redis+分布式锁：
+        
+
+    1. 超卖问题：用Redis Lua脚本实现「查库存→扣库存」的原子操作，避免并发扣减导致超卖；
+
+    2. 一人一单：用Redisson分布式锁（锁Key: lock:seckill:用户ID+优惠券ID），加锁后查询订单表，确认未下单再扣库存、创建订单；
+
+    3. 异步优化：把创建订单放到Kafka消费者，前端快速返回，提升秒杀接口QPS。
+
+### 5. 项目中Redis的使用场景有哪些？（请全面说明）
+
+- 回答时长：1分钟
+
+- 标准答案：覆盖6大核心场景，贯穿整个项目：
+        
+
+    1. 核心缓存：商户、优惠券信息（三级缓存核心）；
+
+    2. 高并发控制：秒杀库存预扣、分布式锁、接口限流；
+
+    3. 社交功能：点赞（ZSet）、关注（Set）、Feed流推送（ZSet）；
+
+    4. 智能客服：会话记忆（Hash）、高频问题缓存（String）；
+
+    5. 签到功能：Bitmap（每月仅4字节，100万用户仅40MB）；
+
+    6. 限流：用户提问频率、接口访问频率（INCR+EXPIRE）。
+
+### 6. 项目的性能指标有哪些？你是怎么做压测和优化的？
+
+- 回答时长：1分钟
+
+- 标准答案：核心指标+压测优化：
+        
+
+    1. 核心指标：
+                
+
+        - 商户查询：响应时间10ms→1ms，QPS 500→5000；
+
+        - 秒杀接口：QPS 1000→5000，成功率99.9%；
+
+        - 缓存命中率：90%→99%；
+
+    2. 压测工具：JMeter；
+
+    3. 压测场景：单接口压测、混合场景压测；
+
+    4. 优化动作：压测后发现Redis连接池过小，调整最大连接数从20→50，解决连接超时问题。
+
+### 7. 你在项目中遇到的最大难点是什么？怎么解决的？
+
+- 回答时长：1分钟
+
+- 标准答案：难点：秒杀场景下的「高并发+数据一致性+异步解耦」；
+        解决：
+       
+
+    1. 用Redis Lua脚本解决超卖，保证原子性；
+
+    2. 用Redisson分布式锁解决一人一单，避免刷单；
+
+    3. 用Kafka替代Redis Stream做异步下单，新增死信队列处理失败订单；
+
+    4. 压测优化Redis连接池参数，提升接口吞吐量。
+
+## 三、面试避坑指南
+
+1. 数据化表达：所有技术优化必须带“数据提升”，比如“响应时间从10ms降到1ms”“QPS从1000提升到5000”，比单纯说“用了XX技术”更有说服力；
+
+2. 绑定代码细节：回答时提及具体的Redis Key、注解、配置，比如“会话记忆Key是chat:memory:用户ID”“工具用@Tool注解标注”，证明你真的写过代码；
+
+3. 不夸大功能：智能客服只说“实现了商户查询、预约到店核心功能”，不吹“全功能智能客服”，避免被追问复杂的大模型底层；
+
+4. 关联黑马点评：所有回答都要和黑马点评的技术栈、业务逻辑绑定，体现“基于黑马点评做升级”的合理性。
+> （注：文档部分内容可能由 AI 生成）
